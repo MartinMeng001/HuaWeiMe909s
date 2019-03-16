@@ -9,11 +9,16 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <pthread.h>
 #include "esm6800_drivers.h"
 #include "Me9094G.h"
+#define PRODUCT_FOR_EC
+
 #define ME909_VENDORID	"0x12d1"
 #define ME909_PRODUCTID	"0x15c1"
+#define EC20_VERDORID	"0x2c7c"
+#define EC20_PRODUCTID	"0x0125"
 #define USBSERIAL_CMD	"usbserial"
 #define PPP0_CMD	"ppp0"
 #define INSMOD_CMD	"insmod /lib/modules/4.1.15-g4f1387e/kernel/drivers/usb/serial/usbserial.ko vendor=%s product=%s"
@@ -23,13 +28,17 @@
 #define DIAL4G_CMD	"pppd call lte-connect-script"
 #define DIAL3G_CMD	"pppd call wcdma-connect-script"
 #define ROUTE_CMD	"route add default gw %s"
+#define ROUTE_CMD_FOR_MULTINETWORKS	"ip route add default via %s dev ppp0 metric 100"
+#define ROUTE_CMD_FOR_SPECIALIPS	"route add -net %s netmask 255.255.255.0 gw %s"
 #define INET_ADDR_CMD "ip addr show | grep \"inet\""
 Me909_4G::Me909_4G() {
 	// TODO Auto-generated constructor stub
 	conn_status=0;
+	alive_status=0;
 	m_thread=0;
 	memset(ipAddr,0,sizeof(ipAddr));
 	memset(gwAddr, 0, sizeof(gwAddr));
+	memset(aimIps, 0, sizeof(aimIps));
 }
 
 Me909_4G::~Me909_4G() {
@@ -72,11 +81,46 @@ int Me909_4G::getGW4Conn(char* gw, int maxlen)
 	strcpy(gw, gwAddr);
 	return 1;
 }
+int Me909_4G::setRouteIps(char* ips, int maxlen)
+{
+	if(maxlen>(int)sizeof(aimIps)) return 0;
+	int length=strlen(ips);
+	if(length>maxlen) return 0;
+	memset(aimIps, 0, sizeof(aimIps));
+	int breakcount=3;
+	for(int i=0;i<length;i++)
+	{
+		aimIps[i]=ips[i];
+		if(ips[i]=='.')breakcount--;
+		if(breakcount==0)
+		{
+			aimIps[i+1]='0';
+			break;
+		}
+	}
+	return 1;
+}
 void Me909_4G::KeepAlive()
 {
-	if(flow_DialChk(2)==0)
+	//if(flow_DialChk(2)==0)
 	{
-		checkConnection();
+		int res;
+		pthread_attr_t attr;
+
+		printf(" 4G keepAlive thread begin\r\n");
+		res=pthread_attr_init(&attr);
+		if(res!=0) printf("Creat attribute for 4G keepAlive failed\r\n");
+		res=pthread_attr_setscope(&attr, PTHREAD_SCOPE_SYSTEM);
+		res+=pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+		if(res!=0)
+		{
+			printf("setting attribute for 4G keepAlive failed\r\n");
+			return;
+		}
+		res=pthread_create(&m_thread, &attr, (void*(*)(void*))&checkConnectionFunc, (void*)this);
+		if(res!=0) return;
+		pthread_attr_destroy(&attr);
+		printf(" 4G keepAlive thread end\r\n");
 	}
 }
 int Me909_4G::checkNetwork()
@@ -88,6 +132,24 @@ int Me909_4G::checkNetwork()
 		return 1;
 	}
 	return 0;
+}
+int Me909_4G::checkConnectionFunc(void* lparam)
+{
+	Me909_4G* pme909=(Me909_4G*)lparam;
+	if(pme909->flow_DialChk(2)==0)
+	{
+		pme909->alive_status=0;
+		if(pme909->flow_DrvChk(2)==0)
+		{
+			pme909->LoadDrv();sleep(1);
+			if(pme909->flow_DrvChk(3)==0) return 0;
+		}
+		pme909->Dial();
+		if(pme909->flow_DialChk(20)==0) return 0;
+		sleep(10);	// wait 10s to build the connection
+		return pme909->checkNetwork();
+	}
+	return 1;
 }
 int Me909_4G::checkConnection()
 {
@@ -201,7 +263,11 @@ int Me909_4G::LoadDrv()
 	char cmdstr[200];
 	memset(cmdstr, 0, sizeof(cmdstr));
 	//sprintf(cmdstr, INSMOD_CMD, ME909_VENDORID, ME909_PRODUCTID);
+#ifdef PRODUCT_FOR_EC
+	sprintf(cmdstr, MODPROBE_CMD, EC20_VERDORID, EC20_PRODUCTID);
+#else
 	sprintf(cmdstr, MODPROBE_CMD, ME909_VENDORID, ME909_PRODUCTID);
+#endif
 	system(cmdstr);
 	conn_status=CONN_STATUS_LOADDRV;
 	return 0;
@@ -290,10 +356,62 @@ int Me909_4G::getIP()
 }
 int Me909_4G::Route()
 {
-	char cmdstr[50];
+	char cmdstr[200];
 	memset(cmdstr, 0, sizeof(cmdstr));
-	sprintf(cmdstr, ROUTE_CMD, gwAddr);
-	system(cmdstr);
+	//sprintf(cmdstr, ROUTE_CMD, gwAddr);
+	if(strlen(aimIps)==0)sprintf(cmdstr, ROUTE_CMD_FOR_MULTINETWORKS, gwAddr);
+	else sprintf(cmdstr, ROUTE_CMD_FOR_SPECIALIPS, aimIps, gwAddr);
+	int status = system(cmdstr);
+	if(status<0)
+	{
+		printf("cmd:%s\t error:%s", cmdstr, strerror(errno));
+	}
+	else
+	{
+		if(WIFEXITED(status))
+		{
+		    printf("normal termination, exit status = %d\n", WEXITSTATUS(status)); //取得cmdstring执行结果
+		}
+		else if(WIFSIGNALED(status))
+		{
+			printf("abnormal termination,signal number =%d\n", WTERMSIG(status));
+		}
+		else if(WIFSTOPPED(status))
+		{
+			printf("process stopped, signal number =%d\n", WSTOPSIG(status));
+		}
+		alive_status=1;
+	}
+	conn_status=CONN_STATUS_ROUTE;
+	return 0;
+}
+int Me909_4G::Route2SpecialIps(char* ip)
+{
+	char cmdstr[200];
+	memset(cmdstr, 0, sizeof(cmdstr));
+	//sprintf(cmdstr, ROUTE_CMD, gwAddr);
+	sprintf(cmdstr, ROUTE_CMD_FOR_SPECIALIPS, aimIps, gwAddr);
+	int status = system(cmdstr);
+	if(status<0)
+	{
+		printf("cmd:%s\t error:%s", cmdstr, strerror(errno));
+	}
+	else
+	{
+		if(WIFEXITED(status))
+		{
+			printf("normal termination, exit status = %d\n", WEXITSTATUS(status)); //取得cmdstring执行结果
+		}
+		else if(WIFSIGNALED(status))
+		{
+			printf("abnormal termination,signal number =%d\n", WTERMSIG(status));
+		}
+		else if(WIFSTOPPED(status))
+		{
+			printf("process stopped, signal number =%d\n", WSTOPSIG(status));
+		}
+		alive_status=1;
+	}
 	conn_status=CONN_STATUS_ROUTE;
 	return 0;
 }

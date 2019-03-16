@@ -22,13 +22,16 @@
 class Me909_4G {
 private:
 	static void Me909ConnectionFunc(void* lparam);
+	static int checkConnectionFunc(void* lparam);
 public:	// interface
 	void Connect4G();
 	void Connect3G();
 	void KeepAlive();
 	int getConnectStatus(){return conn_status;};
+	int getKeepAliveStatus(){return alive_status;}
 	int getIP4Conn(char* ip, int maxlen);
 	int getGW4Conn(char* gw, int maxlen);
+	int setRouteIps(char* ips, int maxlen);
 	int powerResetMe909();	// must be called when initialized
 protected:
 	int resetMe909();
@@ -40,6 +43,7 @@ protected:
 	int Dial3G();
 	int ChkPPP0pid();
 	int Route();
+	int Route2SpecialIps(char* ip);
 	int getIP();
 
 	int findIP(char* source, const char* begin, char* ips, int len);
@@ -64,7 +68,8 @@ protected:
 	int flow_Failed();
 private:
 	int conn_status;
-	char ipAddr[20], gwAddr[20];
+	int alive_status;
+	char ipAddr[20], gwAddr[20], aimIps[20];
 	pthread_t m_thread;
 public:
 	Me909_4G();
